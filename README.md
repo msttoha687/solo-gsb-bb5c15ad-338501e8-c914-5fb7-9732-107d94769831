@@ -74,6 +74,15 @@ UTC 时刻与是否逾期（暂停中截止时刻为空，提交后按提交时�
 （一人多票 / 票内重复 / 稿件不属于其分配名单）返回 `422` 与结构化问题清单，不输出
 任何排序结果。
 
+`POST /meeting-schedule` 提供**评审会讨论时段排期**：接收 `/assign` 可行结果中的
+至多 8 篇稿件与评审人名单、至多 8 个候选时段、每位评审人可出席的时段及各时段的
+非负整数稿件容量，在「每稿全部评审人同时可出席、同一评审人同一时段只讨论一稿、
+时段容量不超出」的全局约束下一次求出**完整排期**（每稿恰占一个时段）。多个可行
+方案按稿件 ID 顺序依次比较对应时段 ID，返回**字典序最小**的方案；输入列表重排
+不改变结果。无完整方案返回 `infeasible` 且**不输出任何部分排期**；数量超限、
+稿件 / 时段 ID 重复、分配名单中的评审人未声明可用时段、可用时段引用未知时段等
+非法输入返回 `422` 与结构化问题清单。
+
 ## 快速启动（单条命令）
 
 ```bash
@@ -95,6 +104,7 @@ curl 直接访问 <http://localhost:8000> 即可（根路径返回服务信息�
 | http://localhost:8000/conflict-audit | 资格审计接口（POST，只读） |
 | http://localhost:8000/review-clock | 评审工时钟重放接口（POST） |
 | http://localhost:8000/decision-ranking | 稿件共识排序接口（POST，Schulze 最强路径） |
+| http://localhost:8000/meeting-schedule | 评审会讨论时段排期接口（POST，字典序最小完整排期） |
 | http://localhost:8000/docs | Swagger 交互式文档 |
 | http://localhost:8000/redoc | ReDoc 文档 |
 
@@ -1116,6 +1126,108 @@ Schulze 最强路径（严格按以下规则）：
 }
 ```
 
+### `POST /meeting-schedule`（评审会讨论时段排期）
+
+评审会前把 `/assign` 已完成分配的稿件排入讨论时段。接口在以下**全局约束**下一次
+求出完整排期（而非逐稿贪心，贪心可能因先占时段导致后续稿件无处可排）：
+
+- **每稿恰占一个时段**；
+- 稿件的**全部评审人**在该时段都必须可出席（缺一不可）；
+- **同一评审人在同一时段至多讨论一篇稿件**（即使时段容量未满也不得跨稿撞场）；
+- 每个时段排入的稿件数**不超过该时段容量**（非负整数，容量为 0 的时段不可用）。
+
+请求体：
+
+```json
+{
+  "assignments": [
+    {"manuscript_id": "m1", "reviewer_ids": ["r1", "r2"]},
+    {"manuscript_id": "m2", "reviewer_ids": ["r1"]}
+  ],
+  "slots": [
+    {"id": "s1", "capacity": 1},
+    {"id": "s2", "capacity": 1}
+  ],
+  "reviewer_availability": [
+    {"reviewer_id": "r1", "slot_ids": ["s1", "s2"]},
+    {"reviewer_id": "r2", "slot_ids": ["s1"]}
+  ]
+}
+```
+
+字段规则：
+
+- `assignments`（必填，**1～8 条**）：`/assign` 可行结果的稿件与评审人名单；
+  稿件 ID 必须唯一，同一条记录内重复的评审人 ID 自动去重；`reviewer_ids` 允许
+  为空列表（该稿无评审人，仍占用一个时段与容量，且不受出席约束）。
+- `slots`（必填，**1～8 个**）：候选讨论时段，`id` 必须唯一；`capacity` 为
+  非负整数稿件容量。
+- `reviewer_availability`（可缺省为空列表）：评审人可出席的时段声明。
+  **分配名单中出现的每位评审人都必须有一条声明**（否则 `422`，
+  `reviewer_availability_missing`）；同一评审人多条声明取**并集**。声明中
+  **空列表**与「未声明」语义不同：空列表表示该评审人全程不可出席（合法输入，
+  求解结果为 `infeasible`），未声明则是非法输入。不在任何稿件名单中出现的
+  评审人无需声明（声明了也忽略，不影响结果）。
+- 可用时段必须全部出现在 `slots` 中，引用未知时段返回 `422`（`unknown_slot`）。
+- 输入列表任意重排不改变结果；ID 比较为字符串字典序（`"s10" < "s2"`）。
+
+可行时响应（`200`）：`schedule` 按稿件 ID 升序排列，给出每稿归属的时段。多个
+可行方案按**稿件 ID 升序依次比较其对应时段 ID**，取该向量**字典序最小**的方案：
+
+```json
+{
+  "status": "feasible",
+  "schedule": [
+    {"manuscript_id": "m1", "slot_id": "s1"},
+    {"manuscript_id": "m2", "slot_id": "s2"}
+  ]
+}
+```
+
+上例中 `m1` 的两位评审人共同可出席的最小时段为 `s1`，`m2`（只需 `r1`）随后
+排入 `s2`。若把 `r2` 的可用时段改为仅 `s2`，则字典序最小解变为 `m1 -> s2`、
+`m2 -> s1`（`m1` 不能只图自己最小而占掉 `m2` 唯一可用的 `s1`——全局回溯保证
+得到的是完整方案中的字典序最小者，而非逐稿贪心的第一个）。
+
+无完整方案时响应（`200`，`schedule` 为 `null`，**不输出任何部分排期**）：
+
+```json
+{"status": "infeasible", "schedule": null}
+```
+
+非法输入响应（`422`，结构化问题清单一次性返回、按
+`(type, manuscript_id, slot_id, reviewer_id)` 确定性排序，**不输出任何排期**）：
+
+| 问题类型 | 含义 |
+| --- | --- |
+| `too_many_manuscripts` | 稿件数量超过 8 篇上限 |
+| `too_many_slots` | 候选时段数量超过 8 个上限 |
+| `duplicate_manuscript` | 稿件 ID 在 `assignments` 中重复出现（携带 `manuscript_id`） |
+| `duplicate_slot` | 时段 ID 在 `slots` 中重复出现（携带 `slot_id`） |
+| `reviewer_availability_missing` | 分配名单中的评审人未声明可出席时段（携带 `reviewer_id`） |
+| `unknown_slot` | 可用时段引用了未在 `slots` 中声明的时段（携带 `reviewer_id` / `slot_id`） |
+
+```json
+{
+  "errors": [
+    {
+      "type": "reviewer_availability_missing",
+      "manuscript_id": null,
+      "slot_id": null,
+      "reviewer_id": "r2",
+      "detail": "分配名单中的评审人 r2 未在 reviewer_availability 中声明可出席的时段"
+    }
+  ]
+}
+```
+
+求解与确定性：稿件与时段先按 ID 排序，搜索按稿件顺序、每稿按时段 ID 升序做
+带回溯的深度优先枚举，首个完整解即字典序最小解；搜索中以前向检查剪枝——
+每篇未排稿件至少还剩一个容量未满且其全部评审人均未在该时段占用的候选时段，
+且全部时段剩余容量之和不小于剩余稿件数（这些条件只会随搜索深入进一步恶化，
+故剪枝不排除任何可行解）。相同业务输入（含列表任意重排、同一评审人多条声明、
+名单内重复评审人）产生逐字节相同的输出；服务无状态。
+
 ### 示例调用
 
 ```bash
@@ -1296,6 +1408,28 @@ curl -s -X POST http://localhost:8000/decision-ranking \
       }'
 # -> ranking = ["m3", "m1", "m2"]（m3>m1 与 m1>m2 各 1 票；m2 与 m3 从未同票，
 #    双向支持均为 0）；pair_support 给出全部有序稿件对的直接支持数
+
+# 评审会排期：每稿全部评审人同时可出席、评审人同一时段不撞场、时段容量不超出，
+# 返回按稿件 ID 顺序比较时段 ID 的字典序最小完整排期
+curl -s -X POST http://localhost:8000/meeting-schedule \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "assignments": [
+          {"manuscript_id": "m1", "reviewer_ids": ["r1", "r2"]},
+          {"manuscript_id": "m2", "reviewer_ids": ["r1"]}
+        ],
+        "slots": [
+          {"id": "s1", "capacity": 1},
+          {"id": "s2", "capacity": 1}
+        ],
+        "reviewer_availability": [
+          {"reviewer_id": "r1", "slot_ids": ["s1", "s2"]},
+          {"reviewer_id": "r2", "slot_ids": ["s1"]}
+        ]
+      }'
+# -> {"status":"feasible","schedule":[
+#       {"manuscript_id":"m1","slot_id":"s1"},
+#       {"manuscript_id":"m2","slot_id":"s2"}]}
 ```
 
 ## 算法与确定性
@@ -1378,6 +1512,16 @@ curl -s -X POST http://localhost:8000/decision-ranking \
 - 所有节点按 ID 排序后建图，BFS / Dijkstra 均按固定邻接顺序与 (费用, 节点下标) 字典序
   执行，算法无随机性：相同输入（含不同的列表顺序）产生逐字节相同的输出，
   同成本解由 ID 顺序确定性地破除（瓶颈割的节点与边同样按业务 ID 确定排序）。
+- 评审会时段排期（`/meeting-schedule`）：稿件与时段先按 ID 排序，把每稿静态候选
+  时段预过滤为「其全部评审人均声明可出席」的时段（ID 升序），再做带回溯的深度优先
+  搜索——稿件按 ID 顺序、每稿按时段 ID 升序尝试，约束包括时段剩余容量与评审人
+  同时段占用集合；第一个完整解即为「按稿件 ID 顺序比较对应时段 ID」的字典序最小
+  方案。每个节点做两条前向剪枝：全部时段剩余容量之和不小于剩余稿件数，且每篇
+  未排稿件至少还有一个当前可放入的候选时段（容量与评审人占用只会随搜索深入继续
+  恶化，剪枝不可能漏掉可行解）。规模上限 8 稿 × 8 时段，最坏深回溯（8 稿争 7 槽
+  一类实例）在毫秒到亚秒级完成。无完整方案时 `infeasible` 且不输出任何部分排期；
+  非法输入在求解前一次性收集并确定性排序返回 422；结果只取决于业务数据集合
+  （列表顺序、同一评审人多条声明、名单内重复评审人均不影响输出）。
 
 ## 本地开发与测试
 
@@ -1392,12 +1536,13 @@ uvicorn app.main:app --reload --port 8000   # 本地起服务
 
 ```
 app/
-  main.py      # FastAPI 入口：/health、/assign、/assign-coverage、/assign-roles、/conflict-audit、/review-clock、/decision-ranking
+  main.py      # FastAPI 入口：/health、/assign、/assign-coverage、/assign-roles、/conflict-audit、/review-clock、/decision-ranking、/meeting-schedule
   models.py    # 请求/响应模型与校验
   solver.py    # 分配求解器：普通模式全局最大流 + 增量模式最小费用最大流 + 负载均衡字典序优化 + 下限覆盖带下界流 + 分角色全局分配
   audit.py     # 资格审计：自稿/显式回避/主题匹配 + 无向合作图最短链（BFS 分层 + 完整 ID 序列字典序破同）
   clock.py     # 工时钟重放：工作日历（工作日 09:00-17:00 UTC、节假日排除）整数秒计时 + 状态机重放与截止时刻投影
   ranking.py   # 共识排序：直接成对支持 + Schulze 最强路径（仅胜者边，Floyd-Warshall 最宽路径）+ 路径强度/ID 破同
+  meeting.py   # 评审会排期：全局回溯 + 前向检查剪枝，求按稿件 ID 顺序比较时段 ID 的字典序最小完整排期
 tests/
   test_assign.py            # /assign 端到端测试
   test_assign_coverage.py   # /assign-coverage 端到端测试
@@ -1405,6 +1550,7 @@ tests/
   test_conflict_audit.py    # /conflict-audit 端到端测试
   test_review_clock.py      # /review-clock 端到端测试
   test_decision_ranking.py  # /decision-ranking 端到端测试
+  test_meeting_schedule.py  # /meeting-schedule 端到端测试
 Dockerfile
 docker-compose.yml
 requirements.txt

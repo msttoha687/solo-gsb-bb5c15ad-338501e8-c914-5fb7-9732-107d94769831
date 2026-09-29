@@ -689,3 +689,107 @@ class DecisionRankingResponse(BaseModel):
     ranking: list[str]
     # 全部有序稿件对 (a != b) 的直接成对支持，按 (manuscript_id_a, manuscript_id_b) 排序
     pair_support: list[PairSupportOut]
+
+
+# ---------- POST /meeting-schedule：评审会讨论时段排期 ----------
+
+MeetingScheduleIssueType = Literal[
+    "too_many_manuscripts",
+    "too_many_slots",
+    "duplicate_manuscript",
+    "duplicate_slot",
+    "reviewer_availability_missing",
+    "unknown_slot",
+]
+
+
+class MeetingAssignmentIn(BaseModel):
+    """一篇 /assign 可行结果中的稿件及其评审人名单（重复评审人自动去重）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    manuscript_id: str = Field(min_length=1, max_length=128, description="稿件 ID（唯一）")
+    reviewer_ids: list[Annotated[str, Field(min_length=1, max_length=128)]] = Field(
+        max_length=10000,
+        description="该稿件的评审人 ID 列表（取自 /assign 的可行分配，重复项自动去重）",
+    )
+
+
+class MeetingSlotIn(BaseModel):
+    """一个候选讨论时段及其非负整数稿件容量。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=128, description="时段 ID（唯一）")
+    capacity: int = Field(
+        ge=0,
+        description="该时段最多可排入的稿件数（非负整数）",
+    )
+
+
+class ReviewerAvailabilityIn(BaseModel):
+    """一位评审人可出席的时段声明（同一评审人多条声明取并集）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reviewer_id: str = Field(min_length=1, max_length=128, description="评审人 ID")
+    slot_ids: list[Annotated[str, Field(min_length=1, max_length=128)]] = Field(
+        max_length=10000,
+        description=(
+            "该评审人可出席的时段 ID 列表；缺省（未声明）与空列表不同："
+            "分配名单中的评审人必须有一条声明，空列表表示全程不可出席"
+        ),
+    )
+
+
+class MeetingScheduleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    assignments: list[MeetingAssignmentIn] = Field(
+        min_length=1, max_length=10000,
+        description=(
+            "/assign 可行结果中的稿件与评审人名单，至多 8 篇；"
+            "同一稿件 ID 重复出现将被拒绝（duplicate_manuscript）"
+        ),
+    )
+    slots: list[MeetingSlotIn] = Field(
+        min_length=1, max_length=10000,
+        description="候选讨论时段，至多 8 个；时段 ID 必须唯一",
+    )
+    reviewer_availability: list[ReviewerAvailabilityIn] = Field(
+        default_factory=list, max_length=10000,
+        description=(
+            "每位评审人可出席的时段；分配名单中出现的评审人必须各有一条声明，"
+            "声明引用未知时段将被拒绝（unknown_slot）"
+        ),
+    )
+
+
+class MeetingScheduleIssueOut(BaseModel):
+    """一条非法输入原因（整体 422 时返回全部问题，不输出任何排期）。"""
+
+    type: MeetingScheduleIssueType
+    manuscript_id: str | None = None
+    slot_id: str | None = None
+    reviewer_id: str | None = None
+    detail: str
+
+
+class MeetingScheduleError(BaseModel):
+    """请求被拒绝（422）：结构化问题清单，不输出排期。"""
+
+    errors: list[MeetingScheduleIssueOut]
+
+
+class ScheduledItemOut(BaseModel):
+    """一篇稿件在完整排期中归属的讨论时段。"""
+
+    manuscript_id: str
+    slot_id: str
+
+
+class MeetingScheduleResponse(BaseModel):
+    # feasible：存在完整排期；infeasible：约束下无完整排期（schedule 为 null，
+    # 不输出任何部分排期）
+    status: Literal["feasible", "infeasible"]
+    schedule: list[ScheduledItemOut] | None = None

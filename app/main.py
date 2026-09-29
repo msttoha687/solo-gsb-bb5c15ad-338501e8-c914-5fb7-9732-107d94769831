@@ -32,23 +32,37 @@ from .models import (
     LockedConflictOut,
     ManuscriptAuditOut,
     ManuscriptRolesOut,
+    MeetingAssignmentIn,
+    MeetingScheduleError,
+    MeetingScheduleIssueOut,
+    MeetingScheduleRequest,
+    MeetingScheduleResponse,
+    MeetingSlotIn,
     PairSupportOut,
     ReviewClockError,
     ReviewClockPairOut,
     ReviewClockRequest,
     ReviewClockResponse,
+    ReviewerAvailabilityIn,
     ReviewerShortfallOut,
     RankingIssueOut,
     RoleAssignRequest,
     RoleAssignResponse,
     RoleAssignmentOut,
     RoleUnsatisfiedOut,
+    ScheduledItemOut,
     SharedPoolOut,
     UnsatisfiedOut,
     WorkloadBalanceOut,
 )
 from .audit import audit_conflicts
 from .ranking import RankingBallot, schulze_rank
+from .meeting import (
+    MeetingAssignment,
+    ReviewerAvailability,
+    MeetingSlot,
+    schedule_meeting,
+)
 from .solver import (
     BottleneckCut,
     ManuscriptSpec,
@@ -60,7 +74,7 @@ from .solver import (
 
 app = FastAPI(
     title="Anonymous Review Assignment API",
-    version="1.9.0",
+    version="1.10.0",
     description=(
         "匿名评审分配服务：基于全局最大流（非逐稿贪心）求满足主题能力、"
         "利益冲突与容量约束的完整分配；不可行时返回缺口诊断与全局最小割证明"
@@ -95,6 +109,12 @@ app = FastAPI(
         "与评审人对已评稿件的严格排序票，按 Schulze 最强路径法（仅成对胜者的"
         "直接支持可作为路径边，路径强度取沿途最小支持的最大值）生成稿件共识"
         "顺序，路径强度无法区分时按稿件 ID 破同，返回完整顺序与成对支持数。"
+        "支持评审会讨论时段排期（POST /meeting-schedule）：接收 /assign 可行结果"
+        "中的至多 8 篇稿件与评审人名单、至多 8 个候选时段、每位评审人可出席的"
+        "时段及时段容量，在每稿全部评审人同时可出席、同一评审人同一时段只讨论"
+        "一稿、时段容量不超出的全局约束下求完整排期，多个可行方案按稿件 ID 顺序"
+        "比较对应时段 ID 取字典序最小者；无完整方案返回 infeasible 且不输出部分"
+        "排期，非法输入返回 422 与结构化问题清单。"
         "服务无状态，不持久化任何稿件/评审信息。"
     ),
 )
@@ -563,5 +583,65 @@ def decision_ranking(req: DecisionRankingRequest):
                 support=p.support,
             )
             for p in result.pair_support
+        ],
+    )
+
+
+@app.post(
+    "/meeting-schedule",
+    response_model=MeetingScheduleResponse,
+    tags=["meeting-schedule"],
+    responses={422: {"model": MeetingScheduleError}},
+)
+def meeting_schedule(req: MeetingScheduleRequest):
+    assignments = [
+        MeetingAssignment(
+            manuscript_id=a.manuscript_id,
+            # 名单内重复评审人自动去重（同一稿重复列同一人不构成自我冲突）
+            reviewer_ids=tuple(sorted(set(a.reviewer_ids))),
+        )
+        for a in req.assignments
+    ]
+    slots = [MeetingSlot(id=s.id, capacity=s.capacity) for s in req.slots]
+    availability = [
+        ReviewerAvailability(
+            reviewer_id=a.reviewer_id,
+            slot_ids=tuple(sorted(set(a.slot_ids))),
+        )
+        for a in req.reviewer_availability
+    ]
+
+    result = schedule_meeting(assignments, slots, availability)
+    if result.issues:
+        # 数量超限 / ID 重复 / 评审人未声明可用时段 / 引用未知时段：整体拒绝，
+        # 不输出任何排期
+        return JSONResponse(
+            status_code=422,
+            content=MeetingScheduleError(
+                errors=[
+                    MeetingScheduleIssueOut(
+                        type=i.type,
+                        manuscript_id=i.manuscript_id,
+                        slot_id=i.slot_id,
+                        reviewer_id=i.reviewer_id,
+                        detail=i.detail,
+                    )
+                    for i in result.issues
+                ]
+            ).model_dump(mode="json"),
+        )
+
+    if not result.feasible:
+        # 约束下无完整排期：不输出任何部分排期
+        return MeetingScheduleResponse(status="infeasible", schedule=None)
+
+    return MeetingScheduleResponse(
+        status="feasible",
+        schedule=[
+            ScheduledItemOut(
+                manuscript_id=item.manuscript_id,
+                slot_id=item.slot_id,
+            )
+            for item in result.schedule
         ],
     )
