@@ -27,6 +27,9 @@ from .models import (
     DecisionRankingError,
     DecisionRankingRequest,
     DecisionRankingResponse,
+    DiscussionScheduleError,
+    DiscussionScheduleRequest,
+    DiscussionScheduleResponse,
     IneligiblePairOut,
     LoadRatioOut,
     LockedConflictOut,
@@ -43,12 +46,20 @@ from .models import (
     RoleAssignResponse,
     RoleAssignmentOut,
     RoleUnsatisfiedOut,
+    ScheduleIssueOut,
+    ScheduledManuscriptOut,
     SharedPoolOut,
     UnsatisfiedOut,
     WorkloadBalanceOut,
 )
 from .audit import audit_conflicts
 from .ranking import RankingBallot, schulze_rank
+from .schedule import (
+    DiscussionAssignment,
+    DiscussionSlot,
+    ReviewerAvailability,
+    solve_discussion_schedule,
+)
 from .solver import (
     BottleneckCut,
     ManuscriptSpec,
@@ -60,7 +71,7 @@ from .solver import (
 
 app = FastAPI(
     title="Anonymous Review Assignment API",
-    version="1.9.0",
+    version="1.10.0",
     description=(
         "匿名评审分配服务：基于全局最大流（非逐稿贪心）求满足主题能力、"
         "利益冲突与容量约束的完整分配；不可行时返回缺口诊断与全局最小割证明"
@@ -95,6 +106,11 @@ app = FastAPI(
         "与评审人对已评稿件的严格排序票，按 Schulze 最强路径法（仅成对胜者的"
         "直接支持可作为路径边，路径强度取沿途最小支持的最大值）生成稿件共识"
         "顺序，路径强度无法区分时按稿件 ID 破同，返回完整顺序与成对支持数。"
+        "支持讨论时段排期（POST /schedule-discussions）：接收 /assign 可行结果中"
+        "至多 8 篇稿件与评审人名单、至多 8 个候选时段、各评审人可出席时段与各时段"
+        "容量，在每稿全体评审人共同可出席、同一评审人同时段只讨论一稿、时段容量"
+        "不超出的全局约束下求完整排期；多方案按稿件 ID 顺序逐位比较时段 ID 取字典序"
+        "最小者，无完整方案时返回 infeasible 且不输出部分排期，非法输入整体 422。"
         "服务无状态，不持久化任何稿件/评审信息。"
     ),
 )
@@ -565,3 +581,62 @@ def decision_ranking(req: DecisionRankingRequest):
             for p in result.pair_support
         ],
     )
+
+
+@app.post(
+    "/schedule-discussions",
+    response_model=DiscussionScheduleResponse,
+    tags=["discussion-schedule"],
+    responses={422: {"model": DiscussionScheduleError}},
+)
+def schedule_discussions(req: DiscussionScheduleRequest):
+    assignments = [
+        DiscussionAssignment(
+            manuscript_id=a.manuscript_id,
+            reviewer_ids=tuple(a.reviewer_ids),
+        )
+        for a in req.assignments
+    ]
+    slots = [
+        DiscussionSlot(id=s.id, capacity=s.capacity)
+        for s in req.slots
+    ]
+    availability = [
+        ReviewerAvailability(
+            reviewer_id=av.reviewer_id,
+            slot_ids=tuple(av.slot_ids),
+        )
+        for av in req.reviewer_availability
+    ]
+
+    result = solve_discussion_schedule(assignments, slots, availability)
+    if result.issues:
+        # 超数量上限 / 重复 ID / 评审人未声明可用时段 / 引用未知时段：
+        # 整体拒绝，不输出任何排期
+        return JSONResponse(
+            status_code=422,
+            content=DiscussionScheduleError(
+                errors=[
+                    ScheduleIssueOut(
+                        type=i.type,
+                        manuscript_id=i.manuscript_id,
+                        slot_id=i.slot_id,
+                        reviewer_id=i.reviewer_id,
+                        detail=i.detail,
+                    )
+                    for i in result.issues
+                ]
+            ).model_dump(mode="json"),
+        )
+
+    if result.schedule or not assignments:
+        return DiscussionScheduleResponse(
+            status="feasible",
+            schedule=[
+                ScheduledManuscriptOut(manuscript_id=mid, slot_id=sid)
+                for mid, sid in result.schedule
+            ],
+        )
+
+    # 输入合法但无完整方案：不输出部分排期
+    return DiscussionScheduleResponse(status="infeasible", schedule=None)

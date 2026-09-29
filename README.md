@@ -1116,6 +1116,111 @@ Schulze 最强路径（严格按以下规则）：
 }
 ```
 
+### `POST /schedule-discussions`（讨论时段排期）
+
+评审会前把 `/assign` **可行分配结果中的稿件排入讨论时段**。接收：
+
+- `assignments`：至多 **8 篇**稿件及其评审人名单（取自 `/assign` 的可行结果；
+  稿件 ID 不得重复，名单内重复评审人 ID 自动去重，`reviewer_ids` 可为空列表）；
+- `slots`：至多 **8 个**候选讨论时段，每个时段带非负整数 `capacity`
+  （该时段最多讨论几篇稿件，`0` 表示该时段不可排稿）；时段 ID 不得重复；
+- `reviewer_availability`：每位评审人可出席的时段列表；同一评审人至多一条
+  记录，列表内重复时段自动去重，允许空列表（该评审人无任何可出席时段）。
+
+在以下全局约束下求**完整**排期（每篇稿件恰好排入一个时段）：
+
+1. 该稿件的**全体评审人在该时段都可出席**（取各人可出席时段的交集）；
+2. **同一评审人在同一时段最多讨论一篇稿件**（即使时段容量未满，两篇稿件共享的
+   评审人也不能在同一时段同时参加两场讨论）；
+3. 该时段被排入的稿件数不超过其 `capacity`。
+
+存在多个可行方案时，按**稿件 ID 升序**排列稿件，逐位比较对应时段 ID，返回
+**字典序最小**的方案（时段按 ID 字符串比较，与输入列表顺序无关）。输入中稿件、
+时段、评审人、时段引用等列表任意重排（以及名单内重复去重）都产生逐字节相同的
+输出。**不存在完整方案时返回 `infeasible` 且 `schedule` 为 `null`，不输出
+任何部分排期。**
+
+请求体：
+
+```json
+{
+  "assignments": [
+    {"manuscript_id": "m1", "reviewer_ids": ["r1", "r2"]},
+    {"manuscript_id": "m2", "reviewer_ids": ["r2", "r3"]}
+  ],
+  "slots": [
+    {"id": "s1", "capacity": 1},
+    {"id": "s2", "capacity": 1}
+  ],
+  "reviewer_availability": [
+    {"reviewer_id": "r1", "slot_ids": ["s1"]},
+    {"reviewer_id": "r2", "slot_ids": ["s1", "s2"]},
+    {"reviewer_id": "r3", "slot_ids": ["s2"]}
+  ]
+}
+```
+
+可行时响应（`200`，`schedule` 按稿件 ID 排序）：
+
+```json
+{
+  "status": "feasible",
+  "schedule": [
+    {"manuscript_id": "m1", "slot_id": "s1"},
+    {"manuscript_id": "m2", "slot_id": "s2"}
+  ]
+}
+```
+
+上例中 m1 的两位评审人共同只能出席 s1、m2 中 r3 只能出席 s2，故唯一完整
+排期即 m1→s1、m2→s2。字典序优化意味着即使两篇稿件都能放进 ID 更小的时段，
+也会在全局约束允许的前提下优先让稿件 ID 最小的稿件占用最小时段——若该选择会使
+后续稿件无时段可排（争用共享评审人或容量不足），求解器回溯后取次优选择。
+
+无完整方案时（`200`，业务状态为 `infeasible`，不输出部分排期）：
+
+```json
+{"status": "infeasible", "schedule": null}
+```
+
+边界约定：
+
+- `assignments` 为空列表时，完整排期就是空方案：
+  `{"status": "feasible", "schedule": []}`；
+- 稿件没有评审人（`reviewer_ids: []`）时不受出席交集约束，只受时段容量限制；
+- 评审人显式声明空可出席列表（`slot_ids: []`）时，含该评审人的稿件无法
+  排入任何时段；
+- 声明了可出席时段但不参与任何稿件的评审人是多余信息，不构成错误；
+- `slots` 为空列表而有待排稿件时判定 `infeasible`（输入本身合法）。
+
+非法输入整体拒绝（`422`，与请求体字段错误的 FastAPI 校验响应同为 422，但本
+结构为 `errors` 数组），问题一次性收集、按 `(type, manuscript_id, slot_id,
+reviewer_id)` 确定性排序，**不输出任何排期**：
+
+| 问题类型 | 含义 |
+| --- | --- |
+| `too_many_manuscripts` | 稿件数超过 8 篇上限 |
+| `too_many_slots` | 候选时段数超过 8 个上限 |
+| `duplicate_manuscript` | 分配名单中出现重复稿件 ID |
+| `duplicate_slot` | 候选时段中出现重复时段 ID |
+| `duplicate_availability` | 同一评审人的可出席时段声明出现多条 |
+| `reviewer_availability_undeclared` | 分配名单中的评审人没有可出席时段声明（含未列出该评审人） |
+| `unknown_slot_reference` | 评审人可出席列表引用了未在 `slots` 中定义的时段 ID |
+
+```json
+{
+  "errors": [
+    {
+      "type": "unknown_slot_reference",
+      "manuscript_id": null,
+      "slot_id": "s404",
+      "reviewer_id": "r1",
+      "detail": "评审人 r1 的可出席时段 s404 未在候选时段中定义，可用时段只能引用已声明的时段 ID"
+    }
+  ]
+}
+```
+
 ### 示例调用
 
 ```bash
@@ -1296,6 +1401,29 @@ curl -s -X POST http://localhost:8000/decision-ranking \
       }'
 # -> ranking = ["m3", "m1", "m2"]（m3>m1 与 m1>m2 各 1 票；m2 与 m3 从未同票，
 #    双向支持均为 0）；pair_support 给出全部有序稿件对的直接支持数
+
+# 讨论时段排期：全体评审人共同可出席、同评审人同时段一稿、时段容量不超出，
+# 多个完整方案按稿件 ID 顺序逐位比较时段 ID，取字典序最小
+curl -s -X POST http://localhost:8000/schedule-discussions \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "assignments": [
+          {"manuscript_id": "m1", "reviewer_ids": ["r1", "r2"]},
+          {"manuscript_id": "m2", "reviewer_ids": ["r2", "r3"]}
+        ],
+        "slots": [
+          {"id": "s1", "capacity": 1},
+          {"id": "s2", "capacity": 1}
+        ],
+        "reviewer_availability": [
+          {"reviewer_id": "r1", "slot_ids": ["s1"]},
+          {"reviewer_id": "r2", "slot_ids": ["s1", "s2"]},
+          {"reviewer_id": "r3", "slot_ids": ["s2"]}
+        ]
+      }'
+# -> status=feasible；schedule = m1->s1（r1 只能 s1）、m2->s2（r3 只能 s2）
+# 无完整方案时 status=infeasible、schedule=null（不输出部分排期）；
+# 超 8 篇/8 时段、重复稿件/时段 ID、评审人未声明可用时段、引用未知时段 -> 422
 ```
 
 ## 算法与确定性
@@ -1375,6 +1503,19 @@ curl -s -X POST http://localhost:8000/decision-ranking \
   严格强于关系、势均力敌者由 ID 确定破同；全票时与通常 Schulze 排序一致。成对支持
   只取决于票集合，稿件、票、评审人列表任意重排以及名单/票内重复均产生逐字节相同的
   结果（全程整数运算）。
+- 讨论时段排期（`/schedule-discussions`）：稿件与时段先按 ID 排序，回溯逐篇（稿件
+  ID 升序）枚举按时段 ID 升序的可行时段，第一个完整解即「按稿件 ID 顺序逐位比较
+  时段 ID」的字典序最小方案，不依赖任何随机或输入顺序。每步落位后对剩余稿件做前向
+  可行性剪枝（松弛掉剩余稿件彼此之间的评审人争用，仅保留出席交集、与已排前缀的争用、
+  时段剩余容量——松弛问题可行是真实问题可行的必要条件，不错杀完整解）：①每稿至少有
+  一个可去时段；②时段侧 Hall 条件（邻接时段剩余容量之和 ≥ 稿件数）；③评审人侧
+  Hall 条件（每位评审人在每个可出席时段是一个容量 1 的右点：凡含该评审人且可行时段
+  全落在某时段集合 T 内的稿件，数量不超过 T 内该评审人仍可服务的时段数）；④带容量
+  Kuhn 增广路（右侧按时段容量复制）存在覆盖全部剩余稿件的匹配。时段至多 8 个，
+  ②③均以时段位掩码 + 子集和 DP 实现（单表至多 256 项），全程整数位运算；
+  非法输入（超 8 篇/8 时段、重复稿件/时段 ID、重复可用时段声明、评审人未声明、
+  引用未知时段）一次性收集为按 `(type, manuscript_id, slot_id, reviewer_id)`
+  确定性排序的问题清单整体拒绝（422），不输出排期。
 - 所有节点按 ID 排序后建图，BFS / Dijkstra 均按固定邻接顺序与 (费用, 节点下标) 字典序
   执行，算法无随机性：相同输入（含不同的列表顺序）产生逐字节相同的输出，
   同成本解由 ID 顺序确定性地破除（瓶颈割的节点与边同样按业务 ID 确定排序）。
@@ -1392,19 +1533,21 @@ uvicorn app.main:app --reload --port 8000   # 本地起服务
 
 ```
 app/
-  main.py      # FastAPI 入口：/health、/assign、/assign-coverage、/assign-roles、/conflict-audit、/review-clock、/decision-ranking
+  main.py      # FastAPI 入口：/health、/assign、/assign-coverage、/assign-roles、/conflict-audit、/review-clock、/decision-ranking、/schedule-discussions
   models.py    # 请求/响应模型与校验
   solver.py    # 分配求解器：普通模式全局最大流 + 增量模式最小费用最大流 + 负载均衡字典序优化 + 下限覆盖带下界流 + 分角色全局分配
   audit.py     # 资格审计：自稿/显式回避/主题匹配 + 无向合作图最短链（BFS 分层 + 完整 ID 序列字典序破同）
   clock.py     # 工时钟重放：工作日历（工作日 09:00-17:00 UTC、节假日排除）整数秒计时 + 状态机重放与截止时刻投影
   ranking.py   # 共识排序：直接成对支持 + Schulze 最强路径（仅胜者边，Floyd-Warshall 最宽路径）+ 路径强度/ID 破同
+  schedule.py  # 讨论时段排期：稿件/时段 ID 排序回溯求字典序最小完整解 + 容量/评审人席位 Hall 剪枝（位掩码子集 DP）+ 带容量 Kuhn
 tests/
-  test_assign.py            # /assign 端到端测试
-  test_assign_coverage.py   # /assign-coverage 端到端测试
-  test_assign_roles.py      # /assign-roles 端到端测试
-  test_conflict_audit.py    # /conflict-audit 端到端测试
-  test_review_clock.py      # /review-clock 端到端测试
-  test_decision_ranking.py  # /decision-ranking 端到端测试
+  test_assign.py                 # /assign 端到端测试
+  test_assign_coverage.py        # /assign-coverage 端到端测试
+  test_assign_roles.py           # /assign-roles 端到端测试
+  test_conflict_audit.py         # /conflict-audit 端到端测试
+  test_review_clock.py          # /review-clock 端到端测试
+  test_decision_ranking.py       # /decision-ranking 端到端测试
+  test_schedule_discussions.py  # /schedule-discussions 端到端测试
 Dockerfile
 docker-compose.yml
 requirements.txt
